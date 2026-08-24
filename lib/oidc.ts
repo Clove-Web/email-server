@@ -1,0 +1,192 @@
+/* lib/oidc.ts
+ * Copyright (c) 2026 Clove Nytrix Doughmination Twilight
+ * SPDX-License-Identifier: MIT
+ * See LICENSE in the project root for the full licence text.
+ */
+/*
+ * OIDC core for the mailbox — framework-agnostic.
+ *
+ * Written against Pocket ID, but this is plain OIDC discovery: any compliant
+ * provider (Authentik, Keycloak, Zitadel…) works. Authorization-code flow with
+ * PKCE; the ID token is verified against the provider's JWKS with `jose`.
+ * server.ts wires these into Hono routes and owns the session/pending-state
+ * storage (see lib/auth).
+ */
+
+import crypto from "node:crypto";
+import {
+  createRemoteJWKSet,
+  jwtVerify,
+} from "jose";
+
+const OIDC = {
+  issuer:                (process.env.OIDC_ISSUER || "").replace(/\/+$/, ""),
+  clientId:               process.env.OIDC_CLIENT_ID || "",
+  clientSecret:           process.env.OIDC_CLIENT_SECRET || "",
+  redirectUri:            process.env.OIDC_REDIRECT_URI || "",
+  scope:                  process.env.OIDC_SCOPE || "openid profile email",
+  postLogoutRedirectUri:  process.env.OIDC_POST_LOGOUT_REDIRECT_URI || "",
+};
+
+interface Discovery {
+  issuer:                 string;
+  authorization_endpoint: string;
+  token_endpoint:         string;
+  jwks_uri:               string;
+  end_session_endpoint?:  string;
+}
+
+let discovery: Discovery | null = null;
+let jwks:      ReturnType<typeof createRemoteJWKSet> | null = null;
+
+async function getDiscovery(): Promise<Discovery> {
+  if (discovery && jwks) return discovery;
+
+  const url = `${OIDC.issuer}/.well-known/openid-configuration`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`OIDC discovery failed (${res.status}) at ${url}`);
+  }
+
+  discovery = (await res.json()) as Discovery;
+  jwks      = createRemoteJWKSet(new URL(discovery.jwks_uri));
+  return discovery;
+}
+
+export async function initOidc(): Promise<void> {
+  const missing = [
+    ["OIDC_ISSUER",        OIDC.issuer],
+    ["OIDC_CLIENT_ID",     OIDC.clientId],
+    ["OIDC_CLIENT_SECRET", OIDC.clientSecret],
+    ["OIDC_REDIRECT_URI",  OIDC.redirectUri],
+  ]
+    .filter(([, v]) => !v)
+    .map(([k]) => k);
+
+  if (missing.length) {
+    throw new Error(`Missing OIDC env vars: ${missing.join(", ")}`);
+  }
+
+  await getDiscovery();
+  console.log(`🔑 OIDC ready — issuer ${OIDC.issuer}`);
+}
+
+// --------------------
+// Helpers
+// --------------------
+
+function b64url(buf: Buffer): string {
+  return buf.toString("base64url");
+}
+
+function randomToken(bytes = 32): string {
+  return b64url(crypto.randomBytes(bytes));
+}
+
+function sanitizeUsername(name: string): string {
+  return name
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9._-]/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function pickUsername(claims: Record<string, unknown>): string {
+  const email = typeof claims.email === "string" ? claims.email.split("@")[0] : "";
+  const raw =
+    (typeof claims.preferred_username === "string" && claims.preferred_username) ||
+    email ||
+    (typeof claims.sub === "string" && claims.sub) ||
+    "";
+  return sanitizeUsername(String(raw));
+}
+
+// --------------------
+// Flow
+// --------------------
+
+export interface Pending {
+  state:        string;
+  nonce:        string;
+  codeVerifier: string;
+  returnTo:     string;
+}
+
+/** Build the PocketID authorize URL and the pending state to stash server-side. */
+export async function buildAuthUrl(returnTo: string): Promise<{ url: string; pending: Pending }> {
+  const d = await getDiscovery();
+
+  const state         = randomToken();
+  const nonce         = randomToken();
+  const codeVerifier  = randomToken(32);
+  const codeChallenge = b64url(
+    crypto.createHash("sha256").update(codeVerifier).digest(),
+  );
+
+  const url = new URL(d.authorization_endpoint);
+  url.searchParams.set("response_type",         "code");
+  url.searchParams.set("client_id",             OIDC.clientId);
+  url.searchParams.set("redirect_uri",          OIDC.redirectUri);
+  url.searchParams.set("scope",                 OIDC.scope);
+  url.searchParams.set("state",                 state);
+  url.searchParams.set("nonce",                 nonce);
+  url.searchParams.set("code_challenge",        codeChallenge);
+  url.searchParams.set("code_challenge_method", "S256");
+
+  return {
+    url: url.toString(),
+    pending: { state, nonce, codeVerifier, returnTo: returnTo.startsWith("/") ? returnTo : "/inbox" },
+  };
+}
+
+/** Exchange the code, verify the ID token, and return the identity. */
+export async function completeLogin(
+  code: string,
+  pending: Pending,
+): Promise<{ username: string; sub: string }> {
+  const d = await getDiscovery();
+
+  const body = new URLSearchParams({
+    grant_type:    "authorization_code",
+    code,
+    redirect_uri:  OIDC.redirectUri,
+    client_id:     OIDC.clientId,
+    client_secret: OIDC.clientSecret,
+    code_verifier: pending.codeVerifier,
+  });
+
+  const tokenRes = await fetch(d.token_endpoint, {
+    method:  "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+  });
+
+  if (!tokenRes.ok) {
+    const text = await tokenRes.text();
+    throw new Error(`token exchange failed (${tokenRes.status}): ${text}`);
+  }
+
+  const tokens = (await tokenRes.json()) as { id_token?: string };
+  if (!tokens.id_token) throw new Error("no id_token returned");
+
+  const { payload } = await jwtVerify(tokens.id_token, jwks!, {
+    issuer:   d.issuer,
+    audience: OIDC.clientId,
+  });
+
+  if (payload.nonce !== pending.nonce) throw new Error("nonce mismatch");
+
+  const username = pickUsername(payload as Record<string, unknown>);
+  if (!username) throw new Error("no usable username in token");
+
+  return { username, sub: String(payload.sub || "") };
+}
+
+/** PocketID end-session URL for logout, if configured. */
+export function endSessionUrl(): string | null {
+  if (!discovery?.end_session_endpoint || !OIDC.postLogoutRedirectUri) return null;
+  const url = new URL(discovery.end_session_endpoint);
+  url.searchParams.set("post_logout_redirect_uri", OIDC.postLogoutRedirectUri);
+  url.searchParams.set("client_id", OIDC.clientId);
+  return url.toString();
+}

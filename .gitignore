@@ -1,0 +1,11 @@
+# Secrets — never commit these. Use .env.example as the template.
+.env
+.env.*
+!.env.example
+
+node_modules/
+
+# Legacy JSON data directory (pre-Postgres installs)
+data/
+
+.DS_Store

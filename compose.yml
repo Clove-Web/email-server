@@ -1,0 +1,46 @@
+# compose.yml
+# Copyright (c) 2026 Clove Nytrix Doughmination Twilight
+# SPDX-License-Identifier: MIT
+# See LICENSE in the project root for the full licence text.
+
+# Template deployment: the mailbox plus its Postgres database.
+# Copy .env.example to .env, fill it in, then `docker compose up -d`.
+#
+# Put a TLS-terminating reverse proxy (Caddy, Traefik, nginx…) in front of the
+# app: the OIDC callback and the Resend webhook both need a public HTTPS URL.
+
+services:
+  app:
+    image: doughmination/pocketid-resend-email-server:latest
+    # To build from a checkout of this repo instead of pulling the image,
+    # comment out `image:` above and uncomment the next line:
+    # build: .
+    container_name: mailbox
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      # Bound to localhost so only the reverse proxy can reach it. Drop the
+      # 127.0.0.1 prefix if you're exposing the app directly.
+      - "127.0.0.1:${MAIL_PORT:-4040}:${MAIL_PORT:-4040}"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:17-alpine
+    container_name: mailbox-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: mailbox
+      POSTGRES_DB: mailbox
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - mailbox-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mailbox -d mailbox"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  mailbox-db:
